@@ -1,6 +1,6 @@
 # pychecksec
 
-`pychecksec` is a focused privesc enumeration tool that analyzes a target Python script
+`pychecksec` is a privesc enumeration tool that analyzes a target Python script
 and its execution context to identify conditions that may allow code execution through
 Python import resolution abuse / Library hijacking.
 
