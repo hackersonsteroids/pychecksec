@@ -133,18 +133,18 @@ def report_import_shadowing(findings: list[str]) -> None:
             printwhite(f"[+] - import '{mod}' is ALREADY shadowed by {where} (sys.path index {idx})")
 
         elif why == "plantable":
-            printwhite(f"[+] - import '{mod}' can be shadowed by placing {mod}.py in {where} (sys.path index {idx})")
+            printwhite(f"[+] - import '{mod}' can be shadowed in {where} (sys.path index {idx}) by placing either {mod}.py OR {mod}/__init__.py")
+
 def normalized_sys_path() -> list[str]:
     out = []
     cwd = os.getcwd()
 
     for idx, p in enumerate(sys.path):
-        if p == "":
-            out.append(f"{idx}:{os.path.abspath(cwd)}, (CWD)")
-        else:
-            out.append(f"{idx}:{os.path.abspath(p)}")
+        real = os.path.abspath(cwd) if p == "" else os.path.abspath(p)
+        out.append(f"{idx}:{real}")
 
     return out
+
 def collect_pycache_dirs(imports: list[str]) -> list[str]:
     out = []
 
@@ -178,6 +178,8 @@ def report_critical_startup_hooks(entries: list[str]) -> None:
 
         if status == "writable" or is_parent_writable(path):
             printwhite(f"[+] - startup hook {hook} at {path} is writable or in writable directory")
+
+
 def report_env_poisoning(findings: list[str]) -> None:
     for entry in findings:
         key, val, status = entry.split(":", 2)
@@ -205,37 +207,60 @@ def sys_path_indexed() -> list[tuple[int, str]]:
     return out
 def check_import_shadowing(imports: list[str]) -> list[str]:
     findings = []
-    
+
+    # Resolve each top-level import once
     resolved = {}
     for name in imports:
         top = name.split(".")[0]
         if top in resolved:
             continue
+
         spec = importlib.util.find_spec(top)
         if not spec:
             resolved[top] = None
-        else:
-            resolved[top] = spec.origin
-
-    from importlib import machinery
-    ext_suffixes = list(machinery.EXTENSION_SUFFIXES)
-
-    sp = sys_path_indexed()
-
-    for top, origin in resolved.items():
-        if origin in ("built-in", "frozen") or origin is None:
             continue
 
-        origin_abs = os.path.abspath(origin)
-        origin_dir = os.path.dirname(origin_abs)
+        # Skip built-in/frozen
+        if spec.origin in ("built-in", "frozen"):
+            resolved[top] = ("builtin", None, None)
+            continue
 
+        # Namespace package: handled elsewhere (your namespace check)
+        if spec.origin is None and spec.submodule_search_locations:
+            resolved[top] = ("namespace", None, None)
+            continue
+
+        # Package: stop at the PARENT directory of the package folder
+        if spec.submodule_search_locations:
+            pkg_dir = os.path.abspath(list(spec.submodule_search_locations)[0])
+            stop_dir = os.path.dirname(pkg_dir)  # this is the sys.path entry that provided it
+            resolved[top] = ("package", pkg_dir, stop_dir)
+            continue
+
+        # Normal module file: stop at directory containing the .py/.so
+        origin_abs = os.path.abspath(spec.origin)
+        stop_dir = os.path.dirname(origin_abs)
+        resolved[top] = ("module", origin_abs, stop_dir)
+
+    ext_suffixes = list(importlib.machinery.EXTENSION_SUFFIXES)
+    sp = sys_path_indexed()
+
+    for top, info in resolved.items():
+        if info is None:
+            continue
+
+        kind, origin_path, stop_dir = info
+        if kind in ("builtin", "namespace"):
+            continue
+
+        # Scan sys.path entries up to (and including) the provider entry (stop_dir)
         for idx, d in sp:
             if not os.path.isdir(d):
                 continue
 
             d_abs = os.path.abspath(d)
 
-            # 1) Check "already shadowed" candidates FIRST
+            # 1) already shadowed checks
             c1 = os.path.join(d_abs, f"{top}.py")
             c2 = os.path.join(d_abs, top, "__init__.py")
 
@@ -247,27 +272,27 @@ def check_import_shadowing(imports: list[str]) -> list[str]:
                 findings.append(f"HIGH:{top}:{idx}:{c2}:already-exists")
                 break
 
+            found_ext = False
             for suf in ext_suffixes:
                 c3 = os.path.join(d_abs, f"{top}{suf}")
                 if os.path.exists(c3):
                     findings.append(f"HIGH:{top}:{idx}:{c3}:already-exists")
+                    found_ext = True
                     break
-            else:
-                c3 = None
-
-            if c3 and os.path.exists(c3):
+            if found_ext:
                 break
 
-            # 2) Stop once we reach the directory containing the resolved origin
-            if d_abs == origin_dir:
+            # Stop once we reach the sys.path entry that actually provided the real import
+            if d_abs == stop_dir:
                 break
 
-            # 3) Otherwise if directory is writable, it’s plantable
+            # 2) plantable if writable+traversable
             if os.access(d_abs, os.W_OK) and os.access(d_abs, os.X_OK):
                 findings.append(f"HIGH:{top}:{idx}:{d_abs}:plantable")
                 break
 
     return findings
+
 def check_namespace_packages(imports: list[str]) -> list[str]:
     findings = []
 
@@ -286,6 +311,72 @@ def check_namespace_packages(imports: list[str]) -> list[str]:
                     findings.append(f"{top}:{d}:namespace-writable")
 
     return findings
+
+def scan_pth_files(site_dirs: list[str]) -> list[str]:
+    """
+    Returns findings like:
+      'writable-pth:/path/file.pth'
+      'exec-line:/path/file.pth'
+      'writable-added-path:/path/file.pth:/added/path'
+    """
+    findings = []
+
+    for sd in site_dirs:
+        try:
+            for fn in os.listdir(sd):
+                if not fn.endswith(".pth"):
+                    continue
+
+                pth = os.path.join(sd, fn)
+
+                # If .pth itself is writable
+                if os.access(pth, os.W_OK):
+                    findings.append(f"writable-pth:{pth}")
+
+                # Parse .pth lines
+                try:
+                    with open(pth, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            s = line.strip()
+                            if not s or s.startswith("#"):
+                                continue
+
+                            # Some .pth lines execute code on startup
+                            if s.startswith("import "):
+                                findings.append(f"exec-line:{pth}")
+                                continue
+
+                            # Otherwise treat as a path being added
+                            added = os.path.abspath(os.path.expanduser(s))
+                            if os.path.isdir(added) and os.access(added, os.W_OK) and os.access(added, os.X_OK):
+                                findings.append(f"writable-added-path:{pth}:{added}")
+
+                except OSError:
+                    continue
+
+        except OSError:
+            continue
+
+    return findings
+def report_pth_findings(findings: list[str]) -> None:
+    for f in findings:
+        parts = f.split(":")
+
+        kind = parts[0]
+
+        if kind == "writable-pth":
+            pth = parts[1]
+            printwhite(f"[+] - writable .pth file: {pth} (startup path/code injection risk)")
+
+        elif kind == "exec-line":
+            pth = parts[1]
+            printwhite(f"[+] - .pth executes code at startup: {pth} (contains 'import ...')")
+
+        elif kind == "writable-added-path":
+            pth = parts[1]
+            added = parts[2]
+            printwhite(f"[+] - .pth adds writable directory to sys.path: {added} (from {pth})")
+
 def report_namespace_findings(findings: list[str]) -> None:
     for entry in findings:
         pkg, d, _ = entry.split(":", 2)
@@ -318,6 +409,124 @@ def check_env_poisoning() -> list[str]:
                 findings.append(f"LD_LIBRARY_PATH:{d}:writable")
 
     return findings
+
+def mark_replaceability(resolved: list[str]) -> list[str]:
+    """
+    Input: entries like 'name:/path/to/module.py' OR 'name:/path/to/package_dir'
+    Output: 'name:path:replaceable' for non-writable file where parent dir is writable
+    """
+    out = []
+
+    for entry in resolved:
+        name, path = entry.split(":", 1)
+
+        if path in ("built-in", "frozen", None):
+            continue
+
+        p = os.path.abspath(path)
+
+        # If it's a directory (package dir), replacement typically means dropping files inside
+        # That’s covered by writable-dir checks, but still useful to flag.
+        if os.path.isdir(p):
+            if os.access(p, os.W_OK) and os.access(p, os.X_OK):
+                out.append(f"{name}:{p}:replaceable")
+            continue
+
+        # If it's a file: not writable but parent writable => replace risk
+        if os.path.isfile(p) and (not os.access(p, os.W_OK)):
+            parent = os.path.dirname(p)
+            if os.access(parent, os.W_OK) and os.access(parent, os.X_OK):
+                out.append(f"{name}:{p}:replaceable")
+
+    return out
+
+def discover_site_package_dirs() -> list[str]:
+    dirs = set()
+
+    try:
+        import site
+        for d in getattr(site, "getsitepackages", lambda: [])():
+            dirs.add(os.path.abspath(d))
+        usd = getattr(site, "getusersitepackages", lambda: None)()
+        if usd:
+            dirs.add(os.path.abspath(usd))
+    except Exception:
+        pass
+
+    # Also include sys.path entries that look like site-packages/dist-packages
+    for p in sys.path:
+        if not p:
+            continue
+        ap = os.path.abspath(p)
+        if "site-packages" in ap or "dist-packages" in ap:
+            dirs.add(ap)
+
+    return [d for d in dirs if os.path.isdir(d)]
+
+
+def scan_pth_files(site_dirs: list[str]) -> list[str]:
+    """
+    Returns findings like:
+      'CRIT:/path/file.pth:writable-pth'
+      'CRIT:/path/file.pth:exec-line'
+      'HIGH:/path/file.pth:/added/path:writable-added-path'
+    """
+    findings = []
+
+    for sd in site_dirs:
+        try:
+            for fn in os.listdir(sd):
+                if not fn.endswith(".pth"):
+                    continue
+                pth = os.path.join(sd, fn)
+
+                # writable .pth itself
+                if os.access(pth, os.W_OK):
+                    findings.append(f"CRIT:{pth}:writable-pth")
+
+                # parse lines
+                try:
+                    with open(pth, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            s = line.strip()
+                            if not s or s.startswith("#"):
+                                continue
+
+                            if s.startswith("import "):
+                                findings.append(f"CRIT:{pth}:exec-line")
+                                continue
+
+                            # treat as path add
+                            added = os.path.abspath(os.path.expanduser(s))
+                            if os.path.isdir(added) and os.access(added, os.W_OK) and os.access(added, os.X_OK):
+                                findings.append(f"HIGH:{pth}:{added}:writable-added-path")
+                except OSError:
+                    continue
+
+        except OSError:
+            continue
+
+    return findings
+
+
+def report_pth_findings(findings: list[str]) -> None:
+    for f in findings:
+        parts = f.split(":")
+
+        sev = parts[0]
+        if sev == "CRIT" and parts[2] == "writable-pth":
+            printwhite(f"[+] - writable .pth file: {parts[1]} (startup path/code injection risk)")
+        elif sev == "CRIT" and parts[2] == "exec-line":
+            printwhite(f"[+] - .pth executes code at startup: {parts[1]} (contains 'import ...')")
+        elif sev == "HIGH" and parts[3] == "writable-added-path":
+            printwhite(f"[+] - .pth adds writable directory to sys.path: {parts[2]} (from {parts[1]})")
+
+def report_replaceable_imports(entries: list[str]) -> None:
+    for entry in entries:
+        module, path, status = entry.rsplit(":", 2)
+        if status == "replaceable":
+            printwhite(f"[+] - {path} from module {module} is NOT writable but is REPLACEABLE (parent dir writable)")
+
 def printgreen(text):
     # Bold neon green (CTF title color)
     print(f"\033[1;38;2;168;234;33m{text}\033[0m")
@@ -418,6 +627,17 @@ print("")
 printgreen("====== Checking environment poisoning ======")
 envFindings = check_env_poisoning()
 report_env_poisoning(envFindings)
+
+print("")
+printgreen("====== Listing replaceable (parent-dir writable) imports ======")
+replaceable = mark_replaceability(targetPaths)
+report_replaceable_imports(replaceable)
+
+print("")
+printgreen("====== Checking .pth poisoning (site-packages path injection) ======")
+sp_dirs = discover_site_package_dirs()
+pth_findings = scan_pth_files(sp_dirs)
+report_pth_findings(pth_findings)
 
 
 # Restore original state cuz why not
